@@ -1,0 +1,397 @@
+do
+    local WriteThrough = (newcclosure and newcclosure(function(tb, k, v) return rawset(tb, k, v) end))
+                         or function(tb, k, v) return rawset(tb, k, v) end
+    -- weak-keyed "already handled" set so a table is NEVER touched twice (re-applying
+    -- a metatable churns detectable state); weak keys let handled tables be GC'd.
+    local seen = setmetatable({}, { __mode = "k" })
+    local function disarm(t)
+        if seen[t] then return end
+        local ok, meta = pcall(getrawmetatable, t)
+        -- only touch tables with NO metatable: slapping a metatable onto one that
+        -- already has (or is locked) is itself detectable and is what rejoins you.
+        if not ok or meta ~= nil then seen[t] = true; return end
+        -- reads (__index) are left untouched so every value the AC reads is real.
+        pcall(setrawmetatable, t, { __newindex = WriteThrough })
+        seen[t] = true
+    end
+    -- throttle=false → one fast uninterrupted pass (used for the FIRST sweep)
+    local function scanOnce(throttle)
+        if type(getgc) ~= "function" then return 0 end
+        local ok, tables = pcall(getgc, true)
+        if not ok or type(tables) ~= "table" then return 0 end
+        local disarmed, count = 0, 0
+        for _, t in pairs(tables) do
+            if _G.__RyftLeaving then return disarmed end   -- leaving: bail instantly (no teardown crash)
+            if type(t) == "table" then
+                if rawget(t, 4) == t and rawget(t, 7) == 6 then
+                    disarm(t)
+                    disarmed = disarmed + 1
+                end
+                count = count + 1
+                if throttle and count % 200 == 0 then
+                    task.wait(math.random(10, 50) / 1000)
+                end
+            end
+        end
+        return disarmed
+    end
+    -- FIRST sweep: synchronous + unthrottled so the hub does not start until the
+    -- sentinel is armed. Bounded wait for getgc (max ~1s) so it can't hang.
+    if type(getgc) ~= "function" then
+        local waited = 0
+        while type(getgc) ~= "function" and waited < 1 do task.wait(0.05); waited = waited + 0.05 end
+    end
+    pcall(scanOnce, false)
+    -- LEAVE-SAFE: keep scanning in the background so late/re-armed sentinels are
+    -- caught (stays undetected), BUT stop the instant we're leaving/kicking so the
+    -- loop can NEVER call getgc/setrawmetatable into a tearing-down client — that
+    -- perpetual getgc loop firing during teardown is what crashed Volt on leave.
+    -- _G.__RyftLeaving is flipped by PlayerRemoving / OnTeleport / self-kick below.
+    _G.__RyftLeaving = _G.__RyftLeaving or false
+    pcall(function()
+        local Players = game:GetService("Players")
+        local LP = Players.LocalPlayer
+        Players.PlayerRemoving:Connect(function(p) if p == LP then _G.__RyftLeaving = true end end)
+        pcall(function() LP.OnTeleport:Connect(function() _G.__RyftLeaving = true end) end)
+        pcall(function() LP.AncestryChanged:Connect(function(_, parent) if parent == nil then _G.__RyftLeaving = true end end) end)
+    end)
+    -- BOUNDED follow-up sweeps ONLY — NOT a forever loop. The initial sweep above
+    -- arms the bypass before the hub loads (the part that actually protects you).
+    -- These extra passes catch any sentinel the AC re-arms during the vulnerable
+    -- startup window, then the scanning STOPS. A perpetual getgc loop running for
+    -- minutes is what got you rejoined at ~5 min — either the AC's own integrity
+    -- heartbeat catches the endless getgc churn, or the loop eventually slaps a
+    -- metatable on a table that matters. The `seen` set means re-armed sentinels are
+    -- each handled exactly once. After the window we go quiet → nothing for a
+    -- long-running check to trip on.
+    task.spawn(function()
+        local deadline = os.clock() + 30      -- scan for the first ~30s only
+        while (not _G.__RyftLeaving) and os.clock() < deadline do
+            task.wait(math.random(700, 1400) / 1000)   -- gentler cadence, less churn
+            if _G.__RyftLeaving then break end
+            pcall(scanOnce, true)
+        end
+    end)
+end
+
+local Players            = game:GetService("Players")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local Workspace          = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+-- ─────────────────────────────  THEME  ─────────────────────────────
+local THEME = {
+    Black       = Color3.fromRGB(6, 8, 14),
+    BgDark      = Color3.fromRGB(9, 13, 24),      -- window base (black / dark blue)
+    BgPanel     = Color3.fromRGB(13, 20, 38),     -- content panel
+    Sidebar     = Color3.fromRGB(7, 10, 20),
+    Stroke      = Color3.fromRGB(30, 46, 82),
+    DarkBlue    = Color3.fromRGB(18, 38, 78),     -- dark blue box
+    LightBlue   = Color3.fromRGB(92, 165, 255),   -- light blue accent / text
+    BlueLine    = Color3.fromRGB(60, 120, 220),
+    RedBox      = Color3.fromRGB(150, 26, 34),    -- red box behind UNLOCK
+    DarkRedBox  = Color3.fromRGB(72, 16, 22),     -- dark red box
+    LightRed    = Color3.fromRGB(255, 118, 118),  -- light red text
+    RedLine     = Color3.fromRGB(190, 45, 55),
+    White       = Color3.fromRGB(255, 255, 255),
+    TextDim     = Color3.fromRGB(150, 165, 195),
+    Dim         = Color3.fromRGB(120, 135, 165),  -- greyed @username / placeholder
+    ToggleOff   = Color3.fromRGB(40, 52, 82),
+    Purple      = Color3.fromRGB(190, 130, 255),  -- keybind text / capture colour
+    Green       = Color3.fromRGB(46, 190, 110),   -- blacklist / confirm green
+    Red         = Color3.fromRGB(210, 60, 70),    -- unblacklist / cancel red
+}
+local FONT      = Enum.Font.GothamMedium
+local FONT_BOLD = Enum.Font.GothamBold
+local TextService = game:GetService("TextService")
+local HttpService = game:GetService("HttpService")
+-- ─────────────  persistence: remember enabled toggles + window drags  ─────────────
+-- Saves to a config file (when the executor supports file IO). The main panel is
+-- NEVER position-saved (it always opens centred) and the tiny R button always
+-- resets to its home spot on re-execute; everything else persists.
+local SAVE_FILE = "rifthub_config.json"
+local RiftSave = { toggles = {}, positions = {}, keys = {}, numbers = {}, choices = {} }
+local function canFiles()
+    return typeof(readfile) == "function" and typeof(writefile) == "function" and typeof(isfile) == "function"
+end
+do
+    if canFiles() then
+        pcall(function()
+            if isfile(SAVE_FILE) then
+                local data = HttpService:JSONDecode(readfile(SAVE_FILE))
+                if type(data) == "table" then
+                    RiftSave.toggles   = data.toggles   or {}
+                    RiftSave.positions = data.positions or {}
+                    RiftSave.keys      = data.keys      or {}
+                    RiftSave.numbers   = data.numbers   or {}
+                    RiftSave.choices   = data.choices   or {}
+                end
+            end
+        end)
+    end
+end
+local function riftSave()
+    if not canFiles() then return end
+    -- write immediately (no debounce) so a change survives even if you
+    -- re-execute the script a split-second later
+    pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(RiftSave)) end)
+end
+local function saveToggle(name, val) RiftSave.toggles[name] = val and true or nil; riftSave() end
+local function savedToggle(name) return RiftSave.toggles[name] == true end
+local function savePos(name, pos)
+    RiftSave.positions[name] = {xs = pos.X.Scale, xo = pos.X.Offset, ys = pos.Y.Scale, yo = pos.Y.Offset}
+    riftSave()
+end
+local function applyPos(name, frame)
+    local d = RiftSave.positions[name]
+    if d then frame.Position = UDim2.new(d.xs or 0, d.xo or 0, d.ys or 0, d.yo or 0) end
+end
+local function saveKey(name, keyCode)
+    RiftSave.keys[name] = keyCode and keyCode.Name or nil
+    riftSave()
+end
+local function savedKey(name)
+    local n = RiftSave.keys[name]
+    if n and Enum.KeyCode[n] then return Enum.KeyCode[n] end
+    return nil
+end
+local function saveNumber(name, v) RiftSave.numbers[name] = v; riftSave() end
+local function savedNumber(name) return RiftSave.numbers[name] end
+local function saveChoice(name, v) RiftSave.choices[name] = v; riftSave() end
+local function savedChoice(name) return RiftSave.choices[name] end
+-- ── AP blacklist (persisted): players who must never be hit by ANY admin action
+--    (proximity / click-to-ap / spam base owner / admin panel). Keyed by userId. ──
+_G.__RyftBlacklist = _G.__RyftBlacklist or {}
+do
+    local raw = savedChoice("APBlacklist")
+    if type(raw) == "string" and raw ~= "" then
+        pcall(function()
+            local t = HttpService:JSONDecode(raw)
+            if type(t) == "table" then _G.__RyftBlacklist = t end
+        end)
+    end
+end
+local function _blSave()
+    pcall(function() saveChoice("APBlacklist", HttpService:JSONEncode(_G.__RyftBlacklist)) end)
+end
+_G.__RyftBlAdd = function(userId, name, display)
+    _G.__RyftBlacklist[tostring(userId)] = { name = name, display = display }
+    _blSave()
+    if _G.__RyftBlChanged then pcall(_G.__RyftBlChanged) end
+end
+_G.__RyftBlRemove = function(userId)
+    _G.__RyftBlacklist[tostring(userId)] = nil
+    _blSave()
+    if _G.__RyftBlChanged then pcall(_G.__RyftBlChanged) end
+end
+-- accepts a Player or a userId
+_G.__RyftIsBlacklisted = function(p)
+    if not p then return false end
+    local id = (typeof(p) == "Instance" and p.UserId) or (type(p) == "number" and p) or tonumber(p)
+    if not id then return false end
+    return _G.__RyftBlacklist[tostring(id)] ~= nil
+end
+-- shared drag flag: when true, hover highlights are suppressed
+local Dragging = false
+-- only one keybind selector can be capturing at a time
+local activeBinder = nil
+-- optional user-set key that also opens/closes the menu (from the Keybinds tab)
+local menuKey = nil
+-- when true the menu can be opened/toggled but NOT dragged
+local Locked = false
+_G.__RyftLocked = false   -- global lock honoured by every extra UI's drag
+-- ── global movable-UI system ──
+-- Extra panels register here so the Settings "Reset GUI" button can send them
+-- home and the Lock button can freeze them all. The main panel and the little
+-- "R" button are intentionally NOT registered (they never save their place).
+_G.__RyftUIRegistry = _G.__RyftUIRegistry or {}
+-- makes any window draggable by a handle: saves its position on release (so it
+-- returns there next execute), restores it now, respects the global lock, and
+-- works with both mouse and touch (smooth on mobile).
+function _G.__RyftRegisterDrag(window, handle, saveKey, homePos)
+    local UIS = game:GetService("UserInputService")
+    if saveKey then applyPos(saveKey, window) end
+    window.Active = true
+    local entry = { window = window, key = saveKey, home = homePos }
+    table.insert(_G.__RyftUIRegistry, entry)
+    local dragging, dragStart, startPos, moveConn, endConn
+    handle.Active = true
+    handle.InputBegan:Connect(function(input)
+        if _G.__RyftLocked then return end
+        if _G.__RyftSliderDragging then return end   -- don't drag the window while using a slider
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragging = true; dragStart = input.Position; startPos = window.Position
+        if moveConn then moveConn:Disconnect() end
+        if endConn then endConn:Disconnect() end
+        moveConn = UIS.InputChanged:Connect(function(mv)
+            if not dragging then return end
+            if mv.UserInputType == Enum.UserInputType.MouseMovement
+            or mv.UserInputType == Enum.UserInputType.Touch then
+                local d = mv.Position - dragStart
+                window.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+        endConn = UIS.InputEnded:Connect(function(en)
+            if en.UserInputType == Enum.UserInputType.MouseButton1
+            or en.UserInputType == Enum.UserInputType.Touch then
+                if dragging and saveKey then savePos(saveKey, window.Position) end
+                dragging = false
+                if moveConn then moveConn:Disconnect(); moveConn = nil end
+                if endConn then endConn:Disconnect(); endConn = nil end
+            end
+        end)
+    end)
+    return entry
+end
+-- send every registered extra UI back to its original spot (and forget the save)
+function _G.__RyftResetUIs()
+    for _, e in ipairs(_G.__RyftUIRegistry) do
+        if e.window and e.window.Parent then
+            if e.key then RiftSave.positions[e.key] = nil; riftSave() end
+            if e.home then e.window.Position = e.home end
+        end
+    end
+end
+function _G.__RyftSetLocked(v)
+    _G.__RyftLocked = v and true or false
+end
+-- GUI Scaling: apply a UIScale to the main window + every registered extra window
+-- AND every registered HUD (the Auto Grab bar, Steal Target, cooldowns, etc. that
+-- aren't draggable and so were never in the drag registry — this is why they used
+-- to ignore the slider). On phones/tablets everything also gets a smaller base
+-- factor so the whole UI fits on-screen exactly like it does on PC, just smaller.
+_G.__RyftGuiScaleCur = _G.__RyftGuiScaleCur or 100
+_G.__RyftScaleExtra  = _G.__RyftScaleExtra  or {}
+-- windows that must NEVER scale (stay the same size on PC + mobile): the Command
+-- Cooldown panel, the Grief Detector, the Invisible Steal HUD, the unlock button.
+_G.__RyftScaleExclude = _G.__RyftScaleExclude or setmetatable({}, {__mode = "k"})
+function _G.__RyftExcludeScale(win)
+    if not win then return end
+    _G.__RyftScaleExclude[win] = true
+    local sc = win:FindFirstChild("RyftUIScale")   -- undo any scale already on it
+    if sc then sc.Scale = 1 end
+end
+function _G.__RyftMobileFactor()
+    local ok, uis = pcall(function() return game:GetService("UserInputService") end)
+    if ok and uis and uis.TouchEnabled and not uis.KeyboardEnabled and not uis.MouseEnabled then
+        return 0.72   -- touch-only device → render a bit smaller so it all fits
+    end
+    return 1
+end
+local function _ryftApplyScaleTo(win, s)
+    if not win then return end
+    if _G.__RyftScaleExclude and _G.__RyftScaleExclude[win] then
+        local ex = win:FindFirstChild("RyftUIScale"); if ex then ex.Scale = 1 end
+        return                                        -- excluded: never scale
+    end
+    local sc = win:FindFirstChild("RyftUIScale")
+    if not sc then sc = Instance.new("UIScale"); sc.Name = "RyftUIScale"; sc.Parent = win end
+    sc.Scale = s
+end
+-- register a standalone HUD frame so the GUI-Scaling slider (and mobile factor)
+-- affects it too. Applies the current scale right away.
+function _G.__RyftRegisterScale(win)
+    if not win then return end
+    table.insert(_G.__RyftScaleExtra, win)
+    local s = math.clamp((_G.__RyftGuiScaleCur or 100) / 100, 0.50, 1.05) * _G.__RyftMobileFactor()
+    _ryftApplyScaleTo(win, s)
+end
+function _G.__RyftSetGuiScale(pct)
+    _G.__RyftGuiScaleCur = tonumber(pct) or 100
+    local s = math.clamp((tonumber(pct) or 100) / 100, 0.50, 1.05) * _G.__RyftMobileFactor()
+    _ryftApplyScaleTo(_G.__RyftMainWindow, s)
+    for _, e in ipairs(_G.__RyftUIRegistry or {}) do _ryftApplyScaleTo(e.window, s) end
+    for _, w in ipairs(_G.__RyftScaleExtra or {}) do _ryftApplyScaleTo(w, s) end
+end
+-- GUI Transparency Scaling: fade ONLY the extra GUIs (never the excluded ones).
+-- 100% = original opacity, lower = more transparent. Original values are cached
+-- so it's fully reversible when you slide it back up.
+_G.__RyftGuiTranspOrig = _G.__RyftGuiTranspOrig or setmetatable({}, {__mode = "k"})
+function _G.__RyftSetGuiTransparency(pct)
+    -- ONLY the panel's own backdrop goes see-through — so the game shows through
+    -- BEHIND the buttons while the buttons/rows/text stay fully solid. The main
+    -- panel, the bottom discord bar and the open/close circle are excluded and never
+    -- change. 100% = solid, lower = more transparent backdrop.
+    local add = 1 - math.clamp((tonumber(pct) or 100) / 100, 0.15, 1)   -- 0..0.85 extra transparency
+    local excl = _G.__RyftTranspExclude or {}
+    for _, e in ipairs(_G.__RyftUIRegistry or {}) do
+        local w = e.window
+        if w and not excl[w] then
+            -- the window frame itself (the backdrop) + any gradient/body layer named
+            -- directly on it; NOT the child buttons.
+            local ob = _G.__RyftGuiTranspOrig[w]
+            if ob == nil then ob = w.BackgroundTransparency; _G.__RyftGuiTranspOrig[w] = ob end
+            pcall(function() w.BackgroundTransparency = ob + (1 - ob) * add end)
+            -- a "Body" backdrop child (if the panel uses one) also fades so the whole
+            -- backdrop is uniform behind the buttons
+            local body = w:FindFirstChild("Body")
+            if body and body:IsA("GuiObject") then
+                local ob2 = _G.__RyftGuiTranspOrig[body]
+                if ob2 == nil then ob2 = body.BackgroundTransparency; _G.__RyftGuiTranspOrig[body] = ob2 end
+                pcall(function() body.BackgroundTransparency = ob2 + (1 - ob2) * add end)
+            end
+        end
+    end
+end
+-- ─────────────────────────  helper builders  ────────────────────────
+local function corner(parent, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = parent
+    return c
+end
+local function stroke(parent, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or THEME.Stroke
+    s.Thickness = thickness or 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = parent
+    return s
+end
+local function pad(parent, all)
+    local p = Instance.new("UIPadding")
+    p.PaddingTop    = UDim.new(0, all)
+    p.PaddingBottom = UDim.new(0, all)
+    p.PaddingLeft   = UDim.new(0, all)
+    p.PaddingRight  = UDim.new(0, all)
+    p.Parent = parent
+    return p
+end
+-- ────────────────────────────  ScreenGui  ───────────────────────────
+local old = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("CleanUI")
+if old then old:Destroy() end
+local gui = Instance.new("ScreenGui")
+gui.Name = "CleanUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 100000     -- main panel always renders ON TOP of every other GUI
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+local RunService = game:GetService("RunService")
+-- ════════ LEAVE HANDLING (matches the known-good build) ════════
+-- The known-good build has NO crash-on-leave "kill switch": it just lets the
+-- client tear down normally, and leaving is clean (no crash, no "you were
+-- kicked" message). The earlier killAll guard (hooking PlayerRemoving /
+-- OnTeleport / AncestryChanged) is what produced the leave crash/message, so it
+-- is removed. We keep these globals defined as harmless no-ops because other
+-- parts of the hub reference them; _G.__RyftDead stays false for the whole
+-- session (the hot loops that check it simply keep running, exactly like the
+-- reference).
+_G.__RyftDead = false
+_G.__RyftLeaveConns = _G.__RyftLeaveConns or {}
+_G.__RyftOwnConns = _G.__RyftOwnConns or {}
+_G.__RyftOnLeave = function(fn) if type(fn)=="function" then _G.__RyftLeaveConns[#_G.__RyftLeaveConns+1] = fn end end
+_G.__RyftKill = function() end   -- no-op: do NOT tear down on leave (that was the crash)
+-- Track YOUR live character the instant it exists / respawns, so FPS Boost's
+-- strip can hard-skip it and never flatten your body into a grey studded block.
+do
+    local LP = game:GetService("Players").LocalPlayer
+    _G.__RyftLocalChar = LP.Character
+    LP.CharacterAdded:Connect(function(c) _G.__RyftLocalChar = c end)
+    LP.CharacterRemoving:Connect(function() _G.__RyftLocalChar = nil end)
+end
+-- ════════ GUI CONFIG NOTIF
